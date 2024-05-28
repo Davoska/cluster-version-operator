@@ -8,8 +8,10 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/openshift/cluster-version-operator/pkg/payload"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/diff"
+	apierrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/tools/record"
 
@@ -341,6 +343,335 @@ func TestUpdateClusterVersionStatus_ReconciliationIssues(t *testing.T) {
 			condition := resourcemerge.FindOperatorStatusCondition(cvStatus.Conditions, reconciliationIssuesConditionType)
 			if diff := cmp.Diff(tc.expectedCondition, condition, ignoreLastTransitionTime); diff != "" {
 				t.Errorf("unexpected condition\n:%s", diff)
+			}
+		})
+	}
+}
+
+func Test_updateClusterVersionStatus_FilteringMultipleErrorsForFailingCondition(t *testing.T) {
+	ignoreLastTransitionTime := cmpopts.IgnoreFields(configv1.ClusterOperatorStatusCondition{}, "LastTransitionTime")
+	type args struct {
+		syncWorkerStatus *SyncWorkerStatus
+	}
+	tests := []struct {
+		name              string
+		args              args
+		expectedCondition *configv1.ClusterOperatorStatusCondition
+	}{
+		{
+			name: "no errors are present",
+			args: args{
+				syncWorkerStatus: &SyncWorkerStatus{
+					Failure: nil,
+				},
+			},
+			expectedCondition: &configv1.ClusterOperatorStatusCondition{
+				Type:   ClusterStatusFailing,
+				Status: configv1.ConditionFalse,
+			},
+		},
+		{
+			name: "single generic error is propagated to the condition",
+			args: args{
+				syncWorkerStatus: &SyncWorkerStatus{
+					Failure: fmt.Errorf("error has happened"),
+				},
+			},
+			expectedCondition: &configv1.ClusterOperatorStatusCondition{
+				Type:    ClusterStatusFailing,
+				Status:  configv1.ConditionTrue,
+				Message: "error has happened",
+			},
+		},
+		{
+			name: "single UpdateEffectNone error is not propagated to the condition",
+			args: args{
+				syncWorkerStatus: &SyncWorkerStatus{
+					Failure: &payload.UpdateError{
+						UpdateEffect: payload.UpdateEffectNone,
+						Reason:       "ClusterOperatorUpdating",
+						Message:      "Cluster operator A is updating",
+					},
+				},
+			},
+			expectedCondition: &configv1.ClusterOperatorStatusCondition{
+				Type:   ClusterStatusFailing,
+				Status: configv1.ConditionFalse,
+			},
+		},
+		{
+			name: "condensed UpdateError is not modified",
+			args: args{
+				syncWorkerStatus: &SyncWorkerStatus{
+					Failure: &payload.UpdateError{
+						Nested: apierrors.NewAggregate([]error{
+							&payload.UpdateError{
+								UpdateEffect: payload.UpdateEffectFail,
+								Reason:       "ClusterOperatorNotAvailable",
+								Message:      "Cluster operator A is not available",
+							},
+							&payload.UpdateError{
+								UpdateEffect: payload.UpdateEffectFail,
+								Reason:       "ClusterOperatorNotAvailable",
+								Message:      "Cluster operator B is not available",
+							},
+						}),
+						UpdateEffect: payload.UpdateEffectFail,
+						Reason:       "ClusterOperatorNotAvailable",
+						Message:      "Cluster operators A, B are not available",
+					},
+				},
+			},
+			expectedCondition: &configv1.ClusterOperatorStatusCondition{
+				Type:    ClusterStatusFailing,
+				Status:  configv1.ConditionTrue,
+				Reason:  "ClusterOperatorNotAvailable",
+				Message: "Cluster operators A, B are not available",
+			},
+		},
+		{
+			name: "MultipleErrors of UpdateEffectFail and UpdateEffectFailAfterInterval errors is not modified",
+			args: args{
+				syncWorkerStatus: &SyncWorkerStatus{
+					Failure: &payload.UpdateError{
+						Nested: apierrors.NewAggregate([]error{
+							&payload.UpdateError{
+								UpdateEffect: payload.UpdateEffectFail,
+								Reason:       "ClusterOperatorNotAvailable",
+								Message:      "Cluster operator A is not available",
+							},
+							&payload.UpdateError{
+								UpdateEffect: payload.UpdateEffectFailAfterInterval,
+								Reason:       "ClusterOperatorDegraded",
+								Message:      "Cluster operator B is degraded",
+							},
+						}),
+						UpdateEffect: payload.UpdateEffectFail,
+						Reason:       "MultipleErrors",
+						Message:      "Multiple errors are preventing progress:\n* Cluster operator A is not available\n* Cluster operator B is degraded",
+					},
+				},
+			},
+			expectedCondition: &configv1.ClusterOperatorStatusCondition{
+				Type:    ClusterStatusFailing,
+				Status:  configv1.ConditionTrue,
+				Reason:  "MultipleErrors",
+				Message: "Multiple errors are preventing progress:\n* Cluster operator A is not available\n* Cluster operator B is degraded",
+			},
+		},
+		{
+			name: "MultipleErrors of UpdateEffectFail and UpdateEffectNone errors is reduced to the UpdateEffectFail error",
+			args: args{
+				syncWorkerStatus: &SyncWorkerStatus{
+					Failure: &payload.UpdateError{
+						Nested: apierrors.NewAggregate([]error{
+							&payload.UpdateError{
+								UpdateEffect: payload.UpdateEffectFail,
+								Reason:       "ClusterOperatorNotAvailable",
+								Message:      "Cluster operator A is not available",
+							},
+							&payload.UpdateError{
+								UpdateEffect: payload.UpdateEffectNone,
+								Reason:       "ClusterOperatorUpdating",
+								Message:      "Cluster operator B is updating versions",
+							},
+						}),
+						UpdateEffect: payload.UpdateEffectFail,
+						Reason:       "MultipleErrors",
+						Message:      "Multiple errors are preventing progress:\n* Cluster operator A is not available\n* Cluster operator B is updating versions",
+					},
+				},
+			},
+			expectedCondition: &configv1.ClusterOperatorStatusCondition{
+				Type:    ClusterStatusFailing,
+				Status:  configv1.ConditionTrue,
+				Reason:  "ClusterOperatorNotAvailable",
+				Message: "Cluster operator A is not available",
+			},
+		},
+		{
+			name: "MultipleErrors of UpdateEffectFail, UpdateEffectFailAfterInterval, and UpdateEffectNone errors is reduced",
+			args: args{
+				syncWorkerStatus: &SyncWorkerStatus{
+					Failure: &payload.UpdateError{
+						Nested: apierrors.NewAggregate([]error{
+							&payload.UpdateError{
+								UpdateEffect: payload.UpdateEffectFail,
+								Reason:       "ClusterOperatorNotAvailable",
+								Message:      "Cluster operator A is not available",
+							},
+							&payload.UpdateError{
+								UpdateEffect: payload.UpdateEffectNone,
+								Reason:       "ClusterOperatorUpdating",
+								Message:      "Cluster operator B is updating versions",
+							},
+							&payload.UpdateError{
+								UpdateEffect: payload.UpdateEffectFailAfterInterval,
+								Reason:       "ClusterOperatorDegraded",
+								Message:      "Cluster operator C is degraded",
+							},
+						}),
+						UpdateEffect: payload.UpdateEffectFail,
+						Reason:       "MultipleErrors",
+						Message:      "Multiple errors are preventing progress:\n* Cluster operator A is not available\n* Cluster operator B is updating versions\n* Cluster operator C is degraded",
+					},
+				},
+			},
+			expectedCondition: &configv1.ClusterOperatorStatusCondition{
+				Type:    ClusterStatusFailing,
+				Status:  configv1.ConditionTrue,
+				Reason:  "MultipleErrors",
+				Message: "Multiple errors are preventing progress:\n* Cluster operator A is not available\n* Cluster operator C is degraded",
+			},
+		},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			gates := fakeRiFlags{}
+			release := configv1.Release{}
+			getAvailableUpdates := func() *availableUpdates { return nil }
+			var noErrors field.ErrorList
+			cvStatus := configv1.ClusterVersionStatus{}
+			updateClusterVersionStatus(&cvStatus, tc.args.syncWorkerStatus, release, getAvailableUpdates, gates, noErrors)
+			condition := resourcemerge.FindOperatorStatusCondition(cvStatus.Conditions, ClusterStatusFailing)
+			if diff := cmp.Diff(tc.expectedCondition, condition, ignoreLastTransitionTime); diff != "" {
+				t.Errorf("unexpected condition\n:%s", diff)
+			}
+		})
+	}
+}
+
+func Test_filterOutUpdateErrors(t *testing.T) {
+	type args struct {
+		errs             []error
+		updateEffectType payload.UpdateEffectType
+	}
+	tests := []struct {
+		name string
+		args args
+		want []error
+	}{
+		{
+			name: "empty errors",
+			args: args{
+				errs:             []error{},
+				updateEffectType: payload.UpdateEffectNone,
+			},
+			want: []error{},
+		},
+		{
+			name: "errors do not contain update errors of the specified value",
+			args: args{
+				errs: []error{
+					&payload.UpdateError{
+						Name:         "Fail",
+						UpdateEffect: payload.UpdateEffectFail,
+					},
+					&payload.UpdateError{
+						Name:         "Report",
+						UpdateEffect: payload.UpdateEffectReport,
+					},
+					&payload.UpdateError{
+						Name:         "Fail After Interval",
+						UpdateEffect: payload.UpdateEffectFailAfterInterval,
+					},
+				},
+				updateEffectType: payload.UpdateEffectNone,
+			},
+			want: []error{
+				&payload.UpdateError{
+					Name:         "Fail",
+					UpdateEffect: payload.UpdateEffectFail,
+				},
+				&payload.UpdateError{
+					Name:         "Report",
+					UpdateEffect: payload.UpdateEffectReport,
+				},
+				&payload.UpdateError{
+					Name:         "Fail After Interval",
+					UpdateEffect: payload.UpdateEffectFailAfterInterval,
+				},
+			},
+		},
+		{
+			name: "errors contain update errors of the specified value UpdateEffectNone",
+			args: args{
+				errs: []error{
+					&payload.UpdateError{
+						Name:         "Fail After Interval",
+						UpdateEffect: payload.UpdateEffectFailAfterInterval,
+					},
+					&payload.UpdateError{
+						Name:         "None #1",
+						UpdateEffect: payload.UpdateEffectNone,
+					},
+					&payload.UpdateError{
+						Name:         "Report",
+						UpdateEffect: payload.UpdateEffectReport,
+					},
+					&payload.UpdateError{
+						Name:         "None #2",
+						UpdateEffect: payload.UpdateEffectNone,
+					},
+				},
+				updateEffectType: payload.UpdateEffectNone,
+			},
+			want: []error{
+				&payload.UpdateError{
+					Name:         "Fail After Interval",
+					UpdateEffect: payload.UpdateEffectFailAfterInterval,
+				},
+				&payload.UpdateError{
+					Name:         "Report",
+					UpdateEffect: payload.UpdateEffectReport,
+				},
+			},
+		},
+		{
+			name: "errors contain update errors of the specified value UpdateEffectReport",
+			args: args{
+				errs: []error{
+					&payload.UpdateError{
+						Name:         "Fail After Interval",
+						UpdateEffect: payload.UpdateEffectFailAfterInterval,
+					},
+					&payload.UpdateError{
+						Name:         "None #1",
+						UpdateEffect: payload.UpdateEffectNone,
+					},
+					&payload.UpdateError{
+						Name:         "Report",
+						UpdateEffect: payload.UpdateEffectReport,
+					},
+					&payload.UpdateError{
+						Name:         "None #2",
+						UpdateEffect: payload.UpdateEffectNone,
+					},
+				},
+				updateEffectType: payload.UpdateEffectReport,
+			},
+			want: []error{
+				&payload.UpdateError{
+					Name:         "Fail After Interval",
+					UpdateEffect: payload.UpdateEffectFailAfterInterval,
+				},
+				&payload.UpdateError{
+					Name:         "None #1",
+					UpdateEffect: payload.UpdateEffectNone,
+				},
+				&payload.UpdateError{
+					Name:         "None #2",
+					UpdateEffect: payload.UpdateEffectNone,
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filtered := filterOutUpdateErrors(tt.args.errs, tt.args.updateEffectType)
+			if difference := cmp.Diff(filtered, tt.want); difference != "" {
+				t.Errorf("got errors differ from expected:\n%s", difference)
 			}
 		})
 	}

@@ -295,6 +295,26 @@ func updateClusterVersionStatus(cvStatus *configv1.ClusterVersionStatus, status 
 
 	progressReason, progressMessage, skipFailure := convertErrorToProgressing(cvStatus.History, now.Time, status)
 
+	// set the failing condition
+	failingErr := filterErrorForFailingCondition(status.Failure, payload.UpdateEffectNone)
+	if failingErr != nil && !skipFailure {
+		var reason string
+		if uErr, ok := failingErr.(*payload.UpdateError); ok {
+			reason = uErr.Reason
+		}
+		resourcemerge.SetOperatorStatusCondition(&cvStatus.Conditions, configv1.ClusterOperatorStatusCondition{
+			Type:               ClusterStatusFailing,
+			Status:             configv1.ConditionTrue,
+			Reason:             reason,
+			Message:            failingErr.Error(),
+			LastTransitionTime: now,
+		})
+	} else {
+		// clear the failure condition
+		resourcemerge.SetOperatorStatusCondition(&cvStatus.Conditions, configv1.ClusterOperatorStatusCondition{Type: ClusterStatusFailing, Status: configv1.ConditionFalse, LastTransitionTime: now})
+	}
+
+	// update progressing
 	if err := status.Failure; err != nil && !skipFailure {
 		var reason string
 		msg := progressMessage
@@ -307,16 +327,6 @@ func updateClusterVersionStatus(cvStatus *configv1.ClusterVersionStatus, status 
 			msg = "an error occurred"
 		}
 
-		// set the failing condition
-		resourcemerge.SetOperatorStatusCondition(&cvStatus.Conditions, configv1.ClusterOperatorStatusCondition{
-			Type:               ClusterStatusFailing,
-			Status:             configv1.ConditionTrue,
-			Reason:             reason,
-			Message:            err.Error(),
-			LastTransitionTime: now,
-		})
-
-		// update progressing
 		if status.Reconciling {
 			resourcemerge.SetOperatorStatusCondition(&cvStatus.Conditions, configv1.ClusterOperatorStatusCondition{
 				Type:               configv1.OperatorProgressing,
@@ -336,9 +346,6 @@ func updateClusterVersionStatus(cvStatus *configv1.ClusterVersionStatus, status 
 		}
 
 	} else {
-		// clear the failure condition
-		resourcemerge.SetOperatorStatusCondition(&cvStatus.Conditions, configv1.ClusterOperatorStatusCondition{Type: ClusterStatusFailing, Status: configv1.ConditionFalse, LastTransitionTime: now})
-
 		// update progressing
 		if status.Reconciling {
 			message := fmt.Sprintf("Cluster version is %s", version)
@@ -411,6 +418,41 @@ func updateClusterVersionStatus(cvStatus *configv1.ClusterVersionStatus, status 
 			LastTransitionTime: now,
 		})
 	}
+}
+
+// filterErrorForFailingCondition filters out update errors based on the given
+// updateEffect. If the err matches the given update effect, nil is
+// returned. If the err has the reason MultipleErrors, its immediate nested
+// errors are filtered out and the error is recreated. Otherwise, the original
+// err is returned.
+func filterErrorForFailingCondition(err error, updateEffect payload.UpdateEffectType) error {
+	if uErr, ok := err.(*payload.UpdateError); ok {
+		if uErr == nil || uErr.UpdateEffect == payload.UpdateEffectNone {
+			return nil
+		}
+		if uErr.Reason == "MultipleErrors" {
+			if nested, ok := uErr.Nested.(interface{ Errors() []error }); ok {
+				filtered := nested.Errors()
+				filtered = filterOutUpdateErrors(filtered, updateEffect)
+				return newMultipleError(filtered)
+			}
+		}
+	}
+	return err
+}
+
+// filterOutUpdateErrors filters out update errors of the given effect.
+func filterOutUpdateErrors(errs []error, updateEffect payload.UpdateEffectType) []error {
+	filtered := make([]error, 0, len(errs))
+	for _, err := range errs {
+		if uErr, ok := err.(*payload.UpdateError); ok {
+			if uErr.UpdateEffect == updateEffect {
+				continue
+			}
+		}
+		filtered = append(filtered, err)
+	}
+	return filtered
 }
 
 func setImplicitlyEnabledCapabilitiesCondition(cvStatus *configv1.ClusterVersionStatus, implicitlyEnabled []configv1.ClusterVersionCapability,
@@ -518,9 +560,10 @@ func convertErrorToProgressing(history []configv1.UpdateHistory, now time.Time, 
 // syncFailingStatus handles generic errors in the cluster version. It tries to preserve
 // all status fields that it can by using the provided config or loading the latest version
 // from the cache (instead of clearing the status).
-// if ierr is nil, return nil
-// if ierr is not nil, update OperatorStatus as Failing and return ierr
+// If ierr is nil or its filtered form is nil, return nil.
+// If ierr is not nil, update OperatorStatus as Failing and return ierr.
 func (optr *Operator) syncFailingStatus(ctx context.Context, original *configv1.ClusterVersion, ierr error) error {
+	ierr = filterErrorForFailingCondition(ierr, payload.UpdateEffectNone)
 	if ierr == nil {
 		return nil
 	}
