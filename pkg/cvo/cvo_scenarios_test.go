@@ -3559,12 +3559,12 @@ func TestCVO_ParallelError(t *testing.T) {
 	worker := o.configSync.(*SyncWorker)
 	b := &errorResourceBuilder{errors: map[string]error{
 		"0000_10_a_file.yaml": &payload.UpdateError{
-			UpdateEffect: payload.UpdateEffectNone,
+			UpdateEffect: payload.UpdateEffectFail,
 			Message:      "Failed to reconcile 10-a-file resource",
 		},
 		"0000_20_a_file.yaml": nil,
 		"0000_20_b_file.yaml": &payload.UpdateError{
-			UpdateEffect: payload.UpdateEffectNone,
+			UpdateEffect: payload.UpdateEffectFail,
 			Message:      "Failed to reconcile 20-b-file resource",
 		},
 	}}
